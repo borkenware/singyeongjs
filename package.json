@@ -1,0 +1,21 @@
+{
+  "name": "@borkenware/singyeongjs",
+  "version": "0.1.0",
+  "description": "NodeJS client for singyeong",
+  "type": "module",
+  "repository": "git@github.com:borkenware/singyeongjs.git",
+  "author": "Cynthia <cyyynthia@borkenware.com>",
+  "license": "BSD-3-Clause",
+  "engines": {
+    "node": ">= 14",
+    "pnpm": ">= 5.15"
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^14.14.25",
+    "typescript": "^4.1.3"
+  }
+}
