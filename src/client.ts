@@ -29,10 +29,10 @@ import type { CertMeta } from 'ws'
 import { URL } from 'url'
 import WebSocket from 'ws'
 import EventEmitter from './events.js'
+import { OpCode } from './payload.js'
 
 type ClientEvents = {
-  connected: (restricted: boolean) => void
-  reconnected: () => void // todo
+  ready: (restricted: boolean) => void
   message: () => void // todo
   close: () => void
   error: (e: Error) => void
@@ -47,13 +47,16 @@ export default class SingyeongClient extends EventEmitter<ClientEvents> {
   private readonly secure: boolean
   private readonly dsn: URL
   private readonly opts: SingyeongOpts
+  // @ts-ignore
   private encoding: 'json'
   private ws?: WebSocket
   private pings: number[]
+  private heartbeatTimer?: NodeJS.Timeout
+  private heartbeatAck: boolean
 
   public readonly applicationId: string
   public readonly clientId: string
-  public readonly websocketUrl: URL
+  public websocketUrl: URL
   public isRestricted: boolean
 
   get isConnected () {
@@ -72,6 +75,7 @@ export default class SingyeongClient extends EventEmitter<ClientEvents> {
     return this.pings.reduce((a, b) => a + b, 0) / this.pings.length
   }
 
+  // todo: accept a pool of dsn for load balancing
   constructor (dsn: string, opts: SingyeongOpts = {}) {
     super()
 
@@ -88,15 +92,14 @@ export default class SingyeongClient extends EventEmitter<ClientEvents> {
     this.applicationId = this.dsn.username
     this.clientId = this.generateClientId() // todo: allow the user to set their own client id?
 
-    // todo: support msgpack encoding (and maybe etf?)
-    // - etf is non-restricted only, and performs very poorly on js (even using native bindings like Discord's erlpack).
-    // - unsure if it's worth the effort here (except maybe to reduce stress on singyeong because erlang is good at (de)serializing etf?)
+    // todo: support msgpack encoding
     this.encoding = 'json'
-    this.websocketUrl = new URL(`${this.secure ? 'wss' : 'ws'}://${this.dsn.hostname}:${this.dsn.port ?? 80}/gateway/websocket?encoding=${this.encoding}`)
+    this.websocketUrl = new URL(`${this.secure ? 'wss' : 'ws'}://${this.dsn.hostname}:${this.dsn.port ?? 80}/gateway/websocket?encoding=json`)
     this.opts = opts
 
-    this.isRestricted = false
     this.pings = []
+    this.isRestricted = false
+    this.heartbeatAck = false
   }
 
   connect (): void {
@@ -105,8 +108,8 @@ export default class SingyeongClient extends EventEmitter<ClientEvents> {
   }
 
   disconnect (): void {
-    if (!this.isConnected) throw new Error('Not connected!')
-    this.ws?.close()
+    if (!this.ws || !this.isConnected) throw new Error('Not connected!')
+    this.ws.close()
   }
 
   private createSocket () {
@@ -115,15 +118,44 @@ export default class SingyeongClient extends EventEmitter<ClientEvents> {
     this.ws.on('message', (msg) => this.handleMessage(msg))
 
     this.ws.on('close', () => {
+      if (this.heartbeatTimer) {
+        clearInterval(this.heartbeatTimer)
+      }
+
       // todo: reconnect
-      // todo: don't emit if closure was expected (e.g. singyeong requested reconnect)
       this.emit('close')
     })
     this.ws.on('error', (e) => this.emit('error', e))
   }
 
+  private send (op: OpCode, data: unknown, evt?: string): void {
+    // todo: handle msgpack
+    if (!this.ws || !this.isConnected) throw new Error('Not connected!') // todo: queue if we're reconnecting
+    this.ws.send(JSON.stringify({
+      op: op,
+      d: data,
+      ts: Date.now(),
+      t: evt
+    }))
+  }
+
+  private sendIdentify (): void {
+    this.send(OpCode.IDENTIFY, { client_id: this.clientId, application_id: this.applicationId })
+  }
+
+  private sendHeartbeat (): void {
+    if (!this.heartbeatAck) {
+      // todo: try reconnecting?
+      this.disconnect()
+      return
+    }
+
+    this.heartbeatAck = false
+    this.send(OpCode.HEARTBEAT, { client_id: this.clientId })
+  }
+
   private handleMessage (msg: WebSocket.Data) {
-    // todo: proper de-serialization based on the format
+    // todo: handle msgpack
     if (typeof msg !== 'string') {
       this.emit('error', new Error('Received binary data, expected string'))
       this.disconnect()
@@ -134,10 +166,40 @@ export default class SingyeongClient extends EventEmitter<ClientEvents> {
     this.pings.push(Date.now() - payload.ts)
     this.pings.shift()
 
+    console.log(payload)
     switch (payload.op) {
+      case OpCode.HELLO:
+        this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), payload.d.heartbeat_interval)
+        this.heartbeatAck = true
+        this.sendIdentify()
+        break
+      case OpCode.READY:
+        // todo: if this is a reconnect, don't re-emit READY and restore metadata
+        this.isRestricted = payload.d.restricted
+        this.emit('ready', payload.d.restricted)
+        break
+      case OpCode.INVALID:
+        this.emit('error', new Error(`Singyeong server raised an error: ${payload.d.error}`))
+        break
+      case OpCode.DISPATCH:
+        break
+      case OpCode.HEARTBEAT_ACK:
+        // todo: check if the client_id matches?
+        this.heartbeatAck = true
+        break
+      case OpCode.GOODBYE:
+        this.ws?.removeAllListeners('close') // Avoid emitting 'close' event
+        this.ws?.close()
+        this.createSocket()
+        break
+      case OpCode.ERROR:
+        this.emit('error', new Error(`Singyeong server raised an unrecoverable error: ${payload.d.error}`))
+        // todo: singyeong will always abort the connection for this class of error. should we try to automatically reconnect?
+        break
       default:
         this.emit('error', new Error(`Received an unexpected payload: unrecognized OP code ${payload.op}`))
         this.disconnect()
+        break
     }    
   }
 
