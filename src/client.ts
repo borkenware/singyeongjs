@@ -26,10 +26,11 @@
  */
 
 import type { CertMeta } from 'ws'
+
 import { URL } from 'url'
-import WebSocket from 'ws'
-import EventEmitter from './events.js'
-import { OpCode } from './payload.js'
+import Connection from './connection.js'
+import { TypedEmitter } from 'tiny-typed-emitter'
+import { OpCode, PayloadData } from './payload.js'
 
 type ClientEvents = {
   ready: (restricted: boolean) => void
@@ -38,48 +39,59 @@ type ClientEvents = {
   error: (e: Error) => void
 }
 
+type DSN = string | URL /* | Array<string | URL> */
+
+export enum State {
+  CONNECTING = 'connected',
+  CONNECTED = 'connected',
+  RECONNECTING = 'reconnecting',
+  DISCONNECTED = 'disconnected',
+}
+
 export type SingyeongOpts = {
+  dsn: DSN
+  authentication?: string
+  proxiedIp?: string
+  namespace?: string
   reconnect?: boolean
   checkServerIdentity?: (servername: string, cert: CertMeta) => boolean
 }
 
-export default class SingyeongClient extends EventEmitter<ClientEvents> {
-  private readonly secure: boolean
-  private readonly dsn: URL
+export default class SingyeongClient extends TypedEmitter<ClientEvents> {
+  private readonly dsn: URL /* | URL[] */
   private readonly opts: SingyeongOpts
-  // @ts-ignore
-  private encoding: 'json'
-  private ws?: WebSocket
-  private pings: number[]
+  private connection?: Connection
   private heartbeatTimer?: NodeJS.Timeout
   private heartbeatAck: boolean
+  private state: State
 
   public readonly applicationId: string
   public readonly clientId: string
-  public websocketUrl: URL
+  public websocketUrl?: URL
   public isRestricted: boolean
 
   get isConnected () {
-    return this.ws?.readyState === WebSocket.OPEN
+    return this.connection?.isConnected ?? false
   }
 
   get isConnecting () {
-    return this.ws?.readyState === WebSocket.CONNECTING
+    return this.connection?.isConnecting ?? false
   }
 
   get ping () {
-    if (!this.isConnected) {
-      return 0
-    }
-
-    return this.pings.reduce((a, b) => a + b, 0) / this.pings.length
+    return this.connection?.ping ?? -1
   }
 
   // todo: accept a pool of dsn for load balancing
-  constructor (dsn: string, opts: SingyeongOpts = {}) {
+  constructor (opts: DSN | SingyeongOpts) {
     super()
 
-    this.dsn = new URL(dsn)
+    if (typeof opts !== 'object' || !('dsn' in opts)) opts = { dsn: opts }
+    this.opts = opts
+
+    // todo: validate dsn arrays
+    this.dsn = typeof opts.dsn === 'string' ? new URL(opts.dsn) : opts.dsn
+  
     if (this.dsn.protocol !== 'singyeong:' && this.dsn.protocol !== 'ssingyeong:') {
       throw new URIError('Invalid DSN: The protocol must be singyeong or ssingyeong.')
     }
@@ -88,62 +100,84 @@ export default class SingyeongClient extends EventEmitter<ClientEvents> {
       throw new URIError('Invalid DSN: You mst specify a username. This represents your application ID on singyeong.')
     }
 
-    this.secure = this.dsn.protocol === 'ssingyeong:'
     this.applicationId = this.dsn.username
     this.clientId = this.generateClientId() // todo: allow the user to set their own client id?
 
-    // todo: support msgpack encoding
-    this.encoding = 'json'
-    this.websocketUrl = new URL(`${this.secure ? 'wss' : 'ws'}://${this.dsn.hostname}:${this.dsn.port ?? 80}/gateway/websocket?encoding=json`)
-    this.opts = opts
-
-    this.pings = []
+    this.heartbeatAck = true
     this.isRestricted = false
-    this.heartbeatAck = false
+    this.state = State.DISCONNECTED
   }
 
-  connect (): void {
-    if (this.isConnected || this.isConnecting) throw new Error('Already connected!')
-    this.createSocket()
+  connect (): void { // todo: connect as soon as the Client is initialized?
+    if (this.state === State.CONNECTED) throw new Error('Already connected!')
+    if (this.state !== State.RECONNECTING) this.state = State.CONNECTING
+    this.connection?.close()
+
+    const dsn = this.getRandomDsn()
+    this.websocketUrl = new URL(`${dsn.protocol === 'ssingyeong:' ? 'wss' : 'ws'}://${dsn.hostname}:${dsn.port ?? 80}/gateway/websocket?encoding=json`)
+    this.connection = new Connection({
+      url: this.websocketUrl,
+      encoding: 'json',
+      checkServerIdentity: this.opts.checkServerIdentity
+    })
+
+    this.connection.once('hello', (d) => this.handleHello(d))
+    this.connection.once('ready', (d) => this.handleReady(d))
+    this.connection.on('heartbeatAck', () => this.handleHeartbeatAck())
+    this.connection.on('goodbye', () => this.handleGoodbye())
+    this.connection.on('dispatch', (d, t) => this.handleDispatch(d, t))
+
+    this.connection.once('close', () => {
+      if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
+      if (this.state !== State.RECONNECTING) {
+        this.state = State.DISCONNECTED
+        this.emit('close')
+      }
+    })
   }
 
   disconnect (): void {
-    if (!this.ws || !this.isConnected) throw new Error('Not connected!')
-    this.ws.close()
+    if (!this.connection || !this.isConnected) throw new Error('Not connected!')
+    this.connection.close()
   }
 
-  private createSocket () {
-    this.pings = Array(5).fill(0)
-    this.ws = new WebSocket(this.websocketUrl, { checkServerIdentity: this.opts.checkServerIdentity })
-    this.ws.on('message', (msg) => this.handleMessage(msg))
+  private reconnect () {
+    this.state = State.RECONNECTING
+    this.connect()
 
-    this.ws.on('close', () => {
-      if (this.heartbeatTimer) {
-        clearInterval(this.heartbeatTimer)
-      }
+    // todo: if reconnect failed, try again
+  }
 
-      // todo: reconnect
-      this.emit('close')
+  private handleHello (payload: PayloadData[OpCode.HELLO]) {
+    this.heartbeatTimer = setInterval(() => this.heartbeat(), payload.heartbeat_interval)
+    this.connection!.send(OpCode.IDENTIFY, {
+      client_id: this.clientId,
+      application_id: this.applicationId,
+      auth: this.opts.authentication,
+      ip: this.opts.proxiedIp,
+      namespace: this.opts.namespace,
     })
-    this.ws.on('error', (e) => this.emit('error', e))
   }
 
-  private send (op: OpCode, data: unknown, evt?: string): void {
-    // todo: handle msgpack
-    if (!this.ws || !this.isConnected) throw new Error('Not connected!') // todo: queue if we're reconnecting
-    this.ws.send(JSON.stringify({
-      op: op,
-      d: data,
-      ts: Date.now(),
-      t: evt
-    }))
+  private handleReady (payload: PayloadData[OpCode.READY]) {
+    this.state = State.CONNECTED
+    this.isRestricted = payload.restricted
+    this.emit('ready', payload.restricted)
   }
 
-  private sendIdentify (): void {
-    this.send(OpCode.IDENTIFY, { client_id: this.clientId, application_id: this.applicationId })
+  private handleHeartbeatAck () {
+    this.heartbeatAck = true
   }
 
-  private sendHeartbeat (): void {
+  private handleGoodbye () {
+    this.reconnect()
+  }
+
+  private handleDispatch (payload: any, event: string) {
+    console.log(payload, event)
+  }
+
+  private heartbeat (): void {
     if (!this.heartbeatAck) {
       // todo: try reconnecting?
       this.disconnect()
@@ -151,56 +185,14 @@ export default class SingyeongClient extends EventEmitter<ClientEvents> {
     }
 
     this.heartbeatAck = false
-    this.send(OpCode.HEARTBEAT, { client_id: this.clientId })
+    this.connection?.send(OpCode.HEARTBEAT, { client_id: this.clientId })
   }
 
-  private handleMessage (msg: WebSocket.Data) {
-    // todo: handle msgpack
-    if (typeof msg !== 'string') {
-      this.emit('error', new Error('Received binary data, expected string'))
-      this.disconnect()
-      return
+  private getRandomDsn (): URL {
+    if (Array.isArray(this.dsn)) {
+      return this.dsn[Math.floor(Math.random() * this.dsn.length)]
     }
-
-    const payload = JSON.parse(msg)
-    this.pings.push(Date.now() - payload.ts)
-    this.pings.shift()
-
-    console.log(payload)
-    switch (payload.op) {
-      case OpCode.HELLO:
-        this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), payload.d.heartbeat_interval)
-        this.heartbeatAck = true
-        this.sendIdentify()
-        break
-      case OpCode.READY:
-        // todo: if this is a reconnect, don't re-emit READY and restore metadata
-        this.isRestricted = payload.d.restricted
-        this.emit('ready', payload.d.restricted)
-        break
-      case OpCode.INVALID:
-        this.emit('error', new Error(`Singyeong server raised an error: ${payload.d.error}`))
-        break
-      case OpCode.DISPATCH:
-        break
-      case OpCode.HEARTBEAT_ACK:
-        // todo: check if the client_id matches?
-        this.heartbeatAck = true
-        break
-      case OpCode.GOODBYE:
-        this.ws?.removeAllListeners('close') // Avoid emitting 'close' event
-        this.ws?.close()
-        this.createSocket()
-        break
-      case OpCode.ERROR:
-        this.emit('error', new Error(`Singyeong server raised an unrecoverable error: ${payload.d.error}`))
-        // todo: singyeong will always abort the connection for this class of error. should we try to automatically reconnect?
-        break
-      default:
-        this.emit('error', new Error(`Received an unexpected payload: unrecognized OP code ${payload.op}`))
-        this.disconnect()
-        break
-    }    
+    return this.dsn
   }
 
   private generateClientId () {

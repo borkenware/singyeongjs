@@ -26,13 +26,76 @@
  */
 
 export enum OpCode {
-  HELLO = 0,
-  IDENTIFY = 1,
-  READY = 2,
-  INVALID = 3,
-  DISPATCH = 4,
-  HEARTBEAT = 5,
-  HEARTBEAT_ACK = 6,
-  GOODBYE = 7,
-  ERROR = 8,
+  HELLO = 0, // recv
+  IDENTIFY = 1, // send
+  READY = 2, // recv
+  INVALID = 3, // recv
+  DISPATCH = 4, // both
+  HEARTBEAT = 5, // send
+  HEARTBEAT_ACK = 6, // recv
+  GOODBYE = 7, // recv
+  ERROR = 8, // recv
+}
+
+export type DispatchEvent =
+ | 'UPDATE_METADATA' // send
+ | 'SEND' // both
+ | 'BROADCAST' // both
+ | 'QUERY_NODES' // send (warn)
+ | 'QUEUE' // both
+ | 'QUEUE_CONFIRM' // recv
+ | 'QUEUE_REQUEST' // send
+ | 'QUEUE_ACK' // send
+
+export type Metadata = 
+  | { type: 'string', value: string }
+  | { type: 'integer', value: number }
+  | { type: 'float', value: number }
+  | { type: 'version', value: string }
+  | { type: 'list', value: any[] }
+  | { type: 'boolean', value: boolean }
+  | { type: 'map', value: Record<string, any> }
+
+export type MetadataType = Metadata['type']
+
+export type PayloadData = {
+  [OpCode.HELLO]: {
+    heartbeat_interval: number
+  }
+  [OpCode.IDENTIFY]: {
+    client_id: string
+    application_id: string
+    auth?: string
+    ip?: string
+    namespace?: string
+  }
+  [OpCode.READY]: {
+    client_id: string
+    restricted: boolean
+  }
+  [OpCode.INVALID]: {
+    error: string
+    extra_info?: null | any
+    d?: any // [Cynthia] message_dispatcher.ex L38 seems to create a payload with a `d` attr?
+  }
+  [OpCode.HEARTBEAT]: {
+    client_id: string
+  }
+  [OpCode.HEARTBEAT_ACK]: {
+    client_id: string
+  }
+  [OpCode.GOODBYE]: {
+    reason: string
+  }
+  [OpCode.ERROR]: {
+    error: string
+    extra_info?: null | any
+  }
+}
+
+export type Payload = {
+  op: OpCode
+  d: any
+  ts: number
+  t: DispatchEvent | null
 }
